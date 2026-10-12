@@ -18,7 +18,7 @@ from there into an Obsidian vault. One-way. See [DESIGN.md](DESIGN.md).
 | `cmd/stele-pull` ls / preview / log / diff / cat / gc / serve | done |
 | `internal/obs` | JSON audit log; Pushgateway not wired |
 | plugin: types/policy/preview | done, contract-tested against the Go fixtures in `schema/` |
-| plugin: sync/store/UI | sync unit-tested against an in-memory adapter; untested in a real vault |
+| plugin: sync/store/UI | sync unit-tested against an in-memory adapter |
 | CI | `worker.yml` and `plugin.yml`, path-filtered, both on contract changes |
 | Deployment | `deploy/` bootstraps homelab-cicd-config: Garage StatefulSet and a CronJob daily at 18:17 SGT; see [deploy/README.md](deploy/README.md) |
 
