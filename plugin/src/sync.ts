@@ -1,10 +1,11 @@
 import { Plugin, Notice, normalizePath } from "obsidian";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { Manifest, Entry, blobKey, latestKey, manifestKey, parseManifest, liveEntries } from "./types";
+import { Manifest, Entry, liveEntries } from "./types";
 import { Policy } from "./policy";
 import { CourseRecord, FileRecord, LocalState, saveState } from "./state";
-import { RemoteStore, chunkSize, CHUNK_THRESHOLD } from "./store";
+import { chunkSize, CHUNK_THRESHOLD } from "./store";
+import { Source } from "./source";
 import { preview, Preview, PreviewItem, isPullable } from "./preview";
 import { courseFolderName } from "./folders";
 
@@ -82,29 +83,14 @@ export interface SyncFolders {
 export class Syncer {
   constructor(
     private plugin: Plugin,
-    private store: RemoteStore,
+    private source: Source,
     private policy: Policy,
     private state: LocalState,
     private settings: SyncFolders,
   ) {}
 
-  async fetchManifest(courseId: number): Promise<Manifest | null> {
-    // Fresh: a cached `latest` names an old run, and the panel then cannot see
-    // anything the worker has published since.
-    const latest = await this.store.getText(latestKey(courseId), { fresh: true });
-    if (!latest) return null;
-    const runId = latest.trim();
-    const key = manifestKey(courseId, runId);
-    const raw = await this.store.getText(key);
-    if (!raw) return null;
-    const m = parseManifest(raw);
-    // The worker's own reader checks this too. A manifest naming another
-    // course or run is a mis-served or hand-copied object, and syncing it
-    // would tombstone the wrong course's files.
-    if (m.course_id !== courseId || m.run_id !== runId) {
-      throw new Error(`stele-pull: ${key} claims course ${m.course_id} run ${m.run_id}`);
-    }
-    return m;
+  fetchManifest(courseId: number): Promise<Manifest | null> {
+    return this.source.manifest(courseId, this.state.courses[String(courseId)]?.files ?? {});
   }
 
   /**
@@ -295,72 +281,69 @@ export class Syncer {
     return res;
   }
 
-  /** @param onBytes - bytes of this file downloaded so far, after each request. */
+  /**
+   * Put one stored entry's bytes at its vault path.
+   *
+   * A store manifest names the hash, so whatever is already in the vault is
+   * judged before any download. Canvas names none: the bytes are downloaded
+   * and hashed first, and judged then.
+   *
+   * @param onBytes - bytes of this file downloaded so far, after each request.
+   */
   private async writeEntry(m: Manifest, e: Entry, onBytes?: (n: number) => void): Promise<WriteOutcome> {
-    if (!e.sha256) throw new Error("stored entry without a hash");
     const adapter = this.plugin.app.vault.adapter;
     const files = this.course(m).files;
     const dest = this.dest(m, e.path);
     const known = files[e.path];
 
-    // One-way sync is NOT a licence to destroy local data.
-    //
-    // The check is on the FILE, not on whether we have a record of it. A vault
-    // synced to a second device arrives with files on disk and an empty
-    // data.json, so gating this on `known` would let the first sync on a new
-    // device silently overwrite the user's edits.
-    if (await adapter.exists(dest)) {
-      const onDisk = await this.hashFile(dest, known);
-      if (onDisk === e.sha256) {
-        // Right bytes already there (second device, or a restored backup).
-        // Adopt it instead of re-downloading.
-        files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
-        return "adopted";
-      }
-      if (onDisk !== known?.sha256) {
-        // Either we have no record of this file, or it no longer matches what
-        // we last wrote. Both mean the bytes are not ours to overwrite.
-        await this.quarantine(m, dest, e.path);
-        return "conflict";
-      }
+    if (e.sha256) {
+      const verdict = await this.judge(m, e, e.sha256, known);
+      if (verdict !== "write") return verdict;
     }
 
     // Part file lives in the plugin folder and is dot-prefixed so Obsidian
     // never indexes a half-written PDF and the user never sees it flicker.
-    const part = normalizePath(`${this.partsDir()}/${e.sha256}.part`);
+    const part = normalizePath(`${this.partsDir()}/${e.sha256 ?? `canvas-${e.canvas_id}`}.part`);
     await this.ensureDir(part);
     if (await adapter.exists(part)) await adapter.remove(part);
 
-    const key = blobKey(e.sha256);
     const hasher = sha256.create();
-
+    let got: string;
     try {
+      let received = 0;
       if (e.size <= CHUNK_THRESHOLD) {
         // Plain GET: no Range arithmetic, and it is the only path that copes
         // with a zero-byte object.
-        const buf = await this.store.getBinary(key);
+        const buf = await this.source.read(e);
         hasher.update(new Uint8Array(buf));
         await adapter.writeBinary(part, buf);
-        onBytes?.(buf.byteLength);
+        received = buf.byteLength;
+        onBytes?.(received);
       } else {
         const cs = chunkSize();
         for (let off = 0; off < e.size; off += cs) {
           const n = Math.min(cs, e.size - off);
-          const buf = await this.store.getRange(key, off, n);
+          const buf = await this.source.readRange(e, off, n);
           hasher.update(new Uint8Array(buf));
           // appendBinary landed in Obsidian 1.12.3 and is why the mobile size
           // ceiling stopped being structural. CapacitorAdapter implements
           // DataAdapter, so this works on phones too.
           await adapter.appendBinary(part, buf);
+          received += buf.byteLength;
           onBytes?.(off + n);
         }
       }
 
+      // The worker's rule: a clean short read must never become the content
+      // of record. With no hash to check against (Canvas), this is the check.
+      if (received !== e.size) {
+        throw new Error(`size mismatch: expected ${e.size} bytes, received ${received}`);
+      }
       // Verify before the rename. Costs nothing (the bytes already passed
       // through the hasher) and is the only check that the store gave us what
       // we asked for.
-      const got = bytesToHex(hasher.digest());
-      if (got !== e.sha256) {
+      got = bytesToHex(hasher.digest());
+      if (e.sha256 && got !== e.sha256) {
         throw new Error(`hash mismatch: expected ${e.sha256.slice(0, 12)} got ${got.slice(0, 12)}`);
       }
     } catch (err) {
@@ -370,11 +353,51 @@ export class Syncer {
       throw err;
     }
 
+    if (!e.sha256) {
+      const verdict = await this.judge(m, e, got, known);
+      if (verdict !== "write") {
+        await adapter.remove(part);
+        return verdict;
+      }
+    }
+
     await this.ensureDir(dest);
     if (await adapter.exists(dest)) await adapter.remove(dest);
     await adapter.rename(part, dest);
-    files[e.path] = { sha256: e.sha256, size: e.size, writtenAt: Date.now() };
+    files[e.path] = record(e, got);
     return "written";
+  }
+
+  /**
+   * What to do about the file already at an entry's vault path, given the
+   * hash of the bytes that belong there: "write" when there is none, or it is
+   * the version this device last wrote.
+   */
+  private async judge(m: Manifest, e: Entry, hash: string, known?: FileRecord): Promise<WriteOutcome | "write"> {
+    const adapter = this.plugin.app.vault.adapter;
+    const dest = this.dest(m, e.path);
+
+    // One-way sync is NOT a licence to destroy local data.
+    //
+    // The check is on the FILE, not on whether we have a record of it. A vault
+    // synced to a second device arrives with files on disk and an empty
+    // data.json, so gating this on `known` would let the first sync on a new
+    // device silently overwrite the user's edits.
+    if (!(await adapter.exists(dest))) return "write";
+    const onDisk = await this.hashFile(dest, known);
+    if (onDisk === hash) {
+      // Right bytes already there (second device, or a restored backup).
+      // Adopt it instead of re-downloading.
+      this.course(m).files[e.path] = record(e, hash);
+      return "adopted";
+    }
+    if (onDisk !== known?.sha256) {
+      // Either we have no record of this file, or it no longer matches what
+      // we last wrote. Both mean the bytes are not ours to overwrite.
+      await this.quarantine(m, dest, e.path);
+      return "conflict";
+    }
+    return "write";
   }
 
   /**
@@ -488,6 +511,14 @@ export class Syncer {
       }
     }
   }
+}
+
+/** What this device keeps about a file it wrote; see FileRecord. */
+function record(e: Entry, sha: string): FileRecord {
+  return {
+    sha256: sha, size: e.size, writtenAt: Date.now(),
+    canvasId: e.canvas_id, updatedAt: e.updated_at, modifiedAt: e.modified_at,
+  };
 }
 
 function parentOf(path: string): string {

@@ -2,6 +2,7 @@ import { Plugin, Notice, WorkspaceLeaf } from "obsidian";
 import { StelePullSettings, DEFAULT_SETTINGS, StelePullSettingTab } from "./settings";
 import { LocalState, loadState, saveState, emptyState } from "./state";
 import { RemoteStore } from "./store";
+import { StoreSource } from "./source";
 import { Syncer, notifyResult, PullProgress, SyncProgress } from "./sync";
 import { Manifest } from "./types";
 import { StelePullView, VIEW_TYPE_STELE_PULL } from "./ui/StelePullView";
@@ -97,7 +98,7 @@ export default class StelePullPlugin extends Plugin {
       return null;
     }
     const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
-    return new Syncer(this, store, this.settings.policy, this.state, this.settings);
+    return new Syncer(this, new StoreSource(store), this.settings.policy, this.state, this.settings);
   }
 
   /**
@@ -200,9 +201,8 @@ export default class StelePullPlugin extends Plugin {
     if (!this.settings.baseUrl) {
       return ids.map((id): CourseCheck => ({ id, status: "error", message: "set the store URL first" }));
     }
-    const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
-    const s = new Syncer(this, store, this.settings.policy, this.state, this.settings);
-    return checkCourses(ids, (id) => s.fetchManifest(id));
+    const store = new StoreSource(new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket }));
+    return checkCourses(ids, (id) => store.course(id));
   }
 
   currentStatus(): string {
