@@ -2,7 +2,8 @@ import { Plugin, Notice, WorkspaceLeaf } from "obsidian";
 import { StelePullSettings, DEFAULT_SETTINGS, StelePullSettingTab } from "./settings";
 import { LocalState, loadState, saveState, emptyState } from "./state";
 import { RemoteStore } from "./store";
-import { Syncer, notifyResult } from "./sync";
+import { Syncer, notifyResult, PullProgress, SyncProgress } from "./sync";
+import { Manifest } from "./types";
 import { StelePullView, VIEW_TYPE_STELE_PULL } from "./ui/StelePullView";
 import { widenRightSidebar } from "./ui/layout";
 import { CourseCheck, checkCourses } from "./courses";
@@ -16,6 +17,9 @@ export default class StelePullPlugin extends Plugin {
   private running = false;
   private status = "idle";
   private statusListeners = new Set<(text: string) => void>();
+  /** The pull's progress through its downloads; null when none is writing files. */
+  private progress: PullProgress | null = null;
+  private progressListeners = new Set<(p: PullProgress | null) => void>();
   /** The last course ID lookup, so Setup can show it again after a re-render. */
   courseCheck?: { ids: number[]; results: CourseCheck[] };
 
@@ -119,7 +123,7 @@ export default class StelePullPlugin extends Plugin {
           // An automatic pull has nothing to refresh until the worker publishes
           // a run this device has not seen.
           if (mode === "automatic" && !(await s.needsSync(m))) continue;
-          notifyResult(await s.syncCourse(m, { mode }));
+          notifyResult(await s.syncCourse(m, { mode, onProgress: this.progressFor(m) }));
         } catch (e) {
           failed.push(courseId);
           console.error(`stele-pull: course ${courseId} failed`, e);
@@ -133,7 +137,62 @@ export default class StelePullPlugin extends Plugin {
       }
     } finally {
       this.running = false;
+      this.setProgress(null);
     }
+  }
+
+  /**
+   * Pull one course's ticked files, for the panel's "Pull selected". Shares
+   * pullAll's guard, so it cannot write the same files as a running pull.
+   */
+  async pullCourse(m: Manifest) {
+    if (this.running) {
+      new Notice("stele-pull: a pull is already running");
+      return;
+    }
+    const s = this.makeSyncer();
+    if (!s) return;
+    this.running = true;
+    this.setStatus("syncing...");
+    try {
+      notifyResult(await s.syncCourse(m, { mode: "manual", onProgress: this.progressFor(m) }));
+      this.setStatus(`synced ${new Date().toLocaleTimeString()}`);
+    } catch (e) {
+      this.setStatus(`sync failed: ${m.course_id}`);
+      new Notice(`stele-pull: ${String(e)}`);
+    } finally {
+      this.running = false;
+      this.setProgress(null);
+    }
+  }
+
+  isPulling(): boolean {
+    return this.running;
+  }
+
+  currentProgress(): PullProgress | null {
+    return this.progress;
+  }
+
+  /** @returns an unsubscribe function; the panel calls it on close. */
+  onProgress(cb: (p: PullProgress | null) => void): () => void {
+    this.progressListeners.add(cb);
+    return () => this.progressListeners.delete(cb);
+  }
+
+  /** Feeds a course's sync progress to the status bar and the panel. */
+  private progressFor(m: Manifest): (p: SyncProgress) => void {
+    const course = m.course_code ?? m.course_name;
+    return (p) => {
+      const pct = p.bytesTotal > 0 ? Math.floor((p.bytes / p.bytesTotal) * 100) : 100;
+      this.setStatus(`pulling ${course}: ${p.files}/${p.filesTotal} files, ${pct}%`);
+      this.setProgress({ ...p, course });
+    };
+  }
+
+  private setProgress(p: PullProgress | null) {
+    this.progress = p;
+    for (const cb of this.progressListeners) cb(p);
   }
 
   /** Look each course ID up in the store, for the Setup form. Never raises a notice. */

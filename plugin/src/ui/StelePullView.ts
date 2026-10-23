@@ -3,7 +3,7 @@ import { Manifest } from "../types";
 import { Preview, PreviewItem, isPullable } from "../preview";
 import { humanBytes } from "../policy";
 import { renderSettings, StelePullPluginLike } from "../settings";
-import { Syncer, notifyResult } from "../sync";
+import { Syncer, PullProgress } from "../sync";
 import { buildTree, filesUnder, TreeFolder } from "../tree";
 
 export const VIEW_TYPE_STELE_PULL = "stele-pull-panel";
@@ -21,8 +21,12 @@ const AUTO_EXPAND_FILES = 12;
 export type StelePullHost = StelePullPluginLike & {
   makeSyncer(opts?: { quiet?: boolean }): Syncer | null;
   pullAll(opts?: { manual?: boolean }): Promise<void>;
+  pullCourse(m: Manifest): Promise<void>;
+  isPulling(): boolean;
   onStatus(cb: (text: string) => void): () => void;
   currentStatus(): string;
+  onProgress(cb: (p: PullProgress | null) => void): () => void;
+  currentProgress(): PullProgress | null;
 };
 
 interface CourseState {
@@ -51,8 +55,11 @@ export class StelePullView extends ItemView {
   private courses = new Map<number, CourseState>();
   private syncer: Syncer | null = null;
   private loading = false;
-  private unsubscribe?: () => void;
+  private unsubscribe: (() => void)[] = [];
   private statusEl?: HTMLElement;
+  private progressEl?: HTMLElement;
+  /** Every pull button, disabled while a pull runs. Refilled by each render. */
+  private pullButtons: HTMLButtonElement[] = [];
   // Which sections the user opened or closed, so a reload does not undo it.
   private setupOpen = false;
   private collapsedCourses = new Set<number>();
@@ -67,7 +74,15 @@ export class StelePullView extends ItemView {
   getIcon() { return "cloud-download"; }
 
   async onOpen() {
-    this.unsubscribe = this.plugin.onStatus((t) => this.statusEl?.setText(t));
+    // Both update in place: a re-render per downloaded chunk would close the
+    // folders the user has open.
+    this.unsubscribe = [
+      this.plugin.onStatus((t) => {
+        this.statusEl?.setText(t);
+        this.updateBusy();
+      }),
+      this.plugin.onProgress(() => this.renderProgress()),
+    ];
     this.render();
     // Only reach for the network if there is somewhere to reach.
     if (this.plugin.settings.baseUrl && this.plugin.settings.courses.length > 0) {
@@ -76,7 +91,7 @@ export class StelePullView extends ItemView {
   }
 
   async onClose() {
-    this.unsubscribe?.();
+    for (const off of this.unsubscribe) off();
   }
 
   /** Re-fetch every configured course's manifest, then re-render. */
@@ -123,6 +138,7 @@ export class StelePullView extends ItemView {
     if (!root) return;
     root.empty();
     root.addClass("stele-pull-view");
+    this.pullButtons = [];
 
     this.renderHeader(root);
     this.renderBody(root.createDiv());
@@ -133,6 +149,7 @@ export class StelePullView extends ItemView {
   private renderHeader(root: HTMLElement) {
     const head = root.createDiv({ cls: "stele-pull-head" });
     this.statusEl = head.createDiv({ cls: "stele-pull-status", text: this.plugin.currentStatus() });
+    this.progressEl = head.createDiv({ cls: "stele-pull-progress" });
 
     const bar = head.createDiv({ cls: "stele-pull-actions" });
     const pull = bar.createEl("button", { text: "Pull now", cls: "mod-cta" });
@@ -143,8 +160,40 @@ export class StelePullView extends ItemView {
         await this.refresh();
       })();
     });
+    this.pullButtons.push(pull);
     const refresh = bar.createEl("button", { text: "Refresh" });
     refresh.addEventListener("click", () => void this.refresh());
+
+    this.renderProgress();
+  }
+
+  /** The download bar under the status line, shown only while files are being written. */
+  private renderProgress() {
+    this.updateBusy();
+    const el = this.progressEl;
+    if (!el) return;
+    const p = this.plugin.currentProgress();
+    el.empty();
+    el.toggle(p !== null);
+    if (!p) return;
+
+    const bar = el.createEl("progress");
+    // A pull of only empty files has nothing to measure in bytes; count files.
+    bar.max = p.bytesTotal > 0 ? p.bytesTotal : p.filesTotal;
+    bar.value = p.bytesTotal > 0 ? p.bytes : p.files;
+    el.createDiv({
+      cls: "stele-pull-muted",
+      text:
+        `${p.course} · ${p.files} of ${p.filesTotal} ${p.filesTotal === 1 ? "file" : "files"} · ` +
+        `${humanBytes(p.bytes)} of ${humanBytes(p.bytesTotal)}`,
+    });
+    if (p.current) el.createDiv({ cls: "stele-pull-muted stele-pull-path", text: p.current });
+  }
+
+  /** One pull at a time: the plugin would refuse a second, so do not offer it. */
+  private updateBusy() {
+    const busy = this.plugin.isPulling();
+    for (const b of this.pullButtons) b.disabled = busy;
   }
 
   private renderBody(body: HTMLElement) {
@@ -214,6 +263,8 @@ export class StelePullView extends ItemView {
       count.dataset.course = String(id);
       const go = foot.createEl("button", { text: "Pull selected", cls: "mod-cta" });
       go.addEventListener("click", () => void this.pullCourse(st));
+      this.pullButtons.push(go);
+      go.disabled = this.plugin.isPulling();
       this.updateCount(id);
     }
 
@@ -368,15 +419,11 @@ export class StelePullView extends ItemView {
   }
 
   private async pullCourse(st: CourseState) {
-    const s = this.syncer ?? this.plugin.makeSyncer();
-    if (!s || !st.manifest) return;
+    if (!st.manifest) return;
     // The ticks are already saved with Syncer.choose, so a manual pull writes
-    // exactly what the panel shows as ticked.
-    try {
-      notifyResult(await s.syncCourse(st.manifest, { mode: "manual" }));
-    } catch (e) {
-      new Notice(`stele-pull: ${String(e)}`);
-    }
+    // exactly what the panel shows as ticked. Through the plugin, so it takes
+    // the one-pull-at-a-time guard and drives the progress bar.
+    await this.plugin.pullCourse(st.manifest);
     await this.refresh();
   }
 

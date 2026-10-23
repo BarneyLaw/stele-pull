@@ -21,6 +21,18 @@
   color: var(--text-muted);
 }
 
+/* Download progress, shown under the status only while a pull writes files. */
+.stele-pull-view .stele-pull-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+  font-size: var(--font-ui-small);
+}
+
+.stele-pull-view .stele-pull-progress progress {
+  width: 100%;
+}
+
 .stele-pull-view .stele-pull-actions {
   display: flex;
   align-items: center;
