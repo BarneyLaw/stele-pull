@@ -16,6 +16,15 @@ export interface FileRecord {
   sha256: string;
   size: number;
   writtenAt: number;
+  /**
+   * The Canvas metadata of the version written. Direct-Canvas mode has no
+   * hash to compare, so these are how it tells an unchanged file. Absent on
+   * records written before they were kept; such a file is downloaded once
+   * more and, if the bytes match, adopted without rewriting.
+   */
+  canvasId?: number;
+  updatedAt?: string;
+  modifiedAt?: string;
 }
 
 /** What this device wrote for one course. */
