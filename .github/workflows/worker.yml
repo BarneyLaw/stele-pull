@@ -28,12 +28,16 @@ on:
       - 'internal/manifest/**'
       - 'internal/policy/**'
       - 'internal/plan/**'
+      - 'internal/portable/**'
+      - 'internal/run/**'
       - 'cmd/stele-pull/**'
       - 'plugin/src/types.ts'
       - 'plugin/src/policy.ts'
       - 'plugin/src/preview.ts'
       - 'plugin/src/store.ts'
       - 'plugin/src/sync.ts'
+      - 'plugin/src/portable.ts'
+      - 'plugin/src/canvas.ts'
       - 'plugin/src/*.test.ts'
   pull_request:
     paths:
@@ -53,12 +57,16 @@ on:
       - 'internal/manifest/**'
       - 'internal/policy/**'
       - 'internal/plan/**'
+      - 'internal/portable/**'
+      - 'internal/run/**'
       - 'cmd/stele-pull/**'
       - 'plugin/src/types.ts'
       - 'plugin/src/policy.ts'
       - 'plugin/src/preview.ts'
       - 'plugin/src/store.ts'
       - 'plugin/src/sync.ts'
+      - 'plugin/src/portable.ts'
+      - 'plugin/src/canvas.ts'
       - 'plugin/src/*.test.ts'
   workflow_dispatch:
 
@@ -107,6 +115,7 @@ jobs:
       - name: Contract fixtures are generated from the Go types
         run: |
           go test ./internal/manifest -run TestContractFixtures -count=1 -update
+          go test ./internal/run -run TestCanvasPathsFixture -count=1 -update
           git diff --exit-code -- schema/
 
       - name: Build

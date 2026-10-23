@@ -21,12 +21,16 @@ on:
       - 'internal/manifest/**'
       - 'internal/policy/**'
       - 'internal/plan/**'
+      - 'internal/portable/**'
+      - 'internal/run/**'
       - 'cmd/stele-pull/**'
       - 'plugin/src/types.ts'
       - 'plugin/src/policy.ts'
       - 'plugin/src/preview.ts'
       - 'plugin/src/store.ts'
       - 'plugin/src/sync.ts'
+      - 'plugin/src/portable.ts'
+      - 'plugin/src/canvas.ts'
       - 'plugin/src/*.test.ts'
   pull_request:
     paths:
@@ -39,12 +43,16 @@ on:
       - 'internal/manifest/**'
       - 'internal/policy/**'
       - 'internal/plan/**'
+      - 'internal/portable/**'
+      - 'internal/run/**'
       - 'cmd/stele-pull/**'
       - 'plugin/src/types.ts'
       - 'plugin/src/policy.ts'
       - 'plugin/src/preview.ts'
       - 'plugin/src/store.ts'
       - 'plugin/src/sync.ts'
+      - 'plugin/src/portable.ts'
+      - 'plugin/src/canvas.ts'
       - 'plugin/src/*.test.ts'
   workflow_dispatch:
 
