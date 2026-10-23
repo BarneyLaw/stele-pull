@@ -38,6 +38,27 @@ export interface SyncOptions {
    * Both process tombstones and claim the run.
    */
   mode?: PullMode;
+  /**
+   * Called before each file, as each chunk of a large file lands, and once at
+   * the end. Never called when the pull has nothing to write.
+   */
+  onProgress?: (p: SyncProgress) => void;
+}
+
+/** How far a pull has got through the files it is writing. */
+export interface SyncProgress {
+  /** Files finished, out of filesTotal. */
+  files: number;
+  filesTotal: number;
+  bytes: number;
+  bytesTotal: number;
+  /** Manifest path of the file being pulled; absent once all are done. */
+  current?: string;
+}
+
+/** A SyncProgress labelled with the course it belongs to, for the UI. */
+export interface PullProgress extends SyncProgress {
+  course: string;
 }
 
 export interface SyncFolders {
@@ -68,7 +89,9 @@ export class Syncer {
   ) {}
 
   async fetchManifest(courseId: number): Promise<Manifest | null> {
-    const latest = await this.store.getText(latestKey(courseId));
+    // Fresh: a cached `latest` names an old run, and the panel then cannot see
+    // anything the worker has published since.
+    const latest = await this.store.getText(latestKey(courseId), { fresh: true });
     if (!latest) return null;
     const runId = latest.trim();
     const key = manifestKey(courseId, runId);
@@ -207,35 +230,41 @@ export class Syncer {
     const course = this.course(m);
     const files = course.files;
 
-    for (const item of p.items) {
-      const wanted = isPullable(item) && this.isSelected(m, item) && (!automatic || item.action === "update");
-      if (!wanted) {
-        res.skipped++;
-        continue;
-      }
+    // isPullable covers exactly download, update and restore, so everything
+    // in todo is written.
+    const todo = p.items.filter(
+      (item) => isPullable(item) && this.isSelected(m, item) && (!automatic || item.action === "update"),
+    );
+    res.skipped += p.items.length - todo.length;
+
+    const bytesTotal = todo.reduce((n, i) => n + i.entry.size, 0);
+    let filesDone = 0;
+    let bytesDone = 0;
+    const report = (current?: string, inFile = 0) =>
+      opts.onProgress?.({
+        files: filesDone, filesTotal: todo.length, bytes: bytesDone + inFile, bytesTotal, current,
+      });
+
+    for (const item of todo) {
+      report(item.entry.path);
       try {
-        switch (item.action) {
-          case "download":
-          case "update":
-          case "restore": {
-            const outcome = await this.writeEntry(m, item.entry);
-            if (outcome === "conflict") res.conflicts.push(item.entry.path);
-            else if (outcome === "adopted") res.adopted++;
-            else if (item.action === "restore") res.restored++;
-            else if (item.action === "download") res.added++;
-            else res.updated++;
-            // The tick is spent once the file is in the vault: delete it later
-            // and it starts unticked again.
-            if (outcome !== "conflict" && course.choices) delete course.choices[item.entry.path];
-            break;
-          }
-          default:
-            res.skipped++;
-        }
+        const outcome = await this.writeEntry(m, item.entry, (n) => report(item.entry.path, n));
+        if (outcome === "conflict") res.conflicts.push(item.entry.path);
+        else if (outcome === "adopted") res.adopted++;
+        else if (item.action === "restore") res.restored++;
+        else if (item.action === "download") res.added++;
+        else res.updated++;
+        // The tick is spent once the file is in the vault: delete it later
+        // and it starts unticked again.
+        if (outcome !== "conflict" && course.choices) delete course.choices[item.entry.path];
       } catch (e) {
         res.errors.push(`${item.entry.path}: ${String(e)}`);
       }
+      // A failed or adopted file still counts as done, so the bar ends full.
+      filesDone++;
+      bytesDone += item.entry.size;
     }
+    if (todo.length > 0) report();
 
     // Tombstones only touch files this vault has, so every pull processes them.
     for (const e of m.entries) {
@@ -266,7 +295,8 @@ export class Syncer {
     return res;
   }
 
-  private async writeEntry(m: Manifest, e: Entry): Promise<WriteOutcome> {
+  /** @param onBytes - bytes of this file downloaded so far, after each request. */
+  private async writeEntry(m: Manifest, e: Entry, onBytes?: (n: number) => void): Promise<WriteOutcome> {
     if (!e.sha256) throw new Error("stored entry without a hash");
     const adapter = this.plugin.app.vault.adapter;
     const files = this.course(m).files;
@@ -311,6 +341,7 @@ export class Syncer {
         const buf = await this.store.getBinary(key);
         hasher.update(new Uint8Array(buf));
         await adapter.writeBinary(part, buf);
+        onBytes?.(buf.byteLength);
       } else {
         const cs = chunkSize();
         for (let off = 0; off < e.size; off += cs) {
@@ -321,6 +352,7 @@ export class Syncer {
           // ceiling stopped being structural. CapacitorAdapter implements
           // DataAdapter, so this works on phones too.
           await adapter.appendBinary(part, buf);
+          onBytes?.(off + n);
         }
       }
 

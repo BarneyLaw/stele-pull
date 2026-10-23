@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import type { Plugin } from "obsidian";
-import { Syncer, uniquify } from "./sync";
+import { Syncer, SyncProgress, uniquify } from "./sync";
 import { RemoteStore } from "./store";
 import { Manifest, Entry, blobKey, latestKey, manifestKey } from "./types";
 import { FileRecord, LocalState, emptyState, loadState } from "./state";
@@ -139,8 +139,11 @@ class FakeStore {
   gets: string[] = [];
   /** Text objects (latest pointers, manifests) by key. */
   texts = new Map<string, string>();
+  /** Keys read with { fresh: true }, i.e. past the HTTP cache. */
+  freshReads: string[] = [];
   constructor(public blobs: Map<string, Uint8Array>) {}
-  getText(key: string) {
+  getText(key: string, opts: { fresh?: boolean } = {}) {
+    if (opts.fresh) this.freshReads.push(key);
     return Promise.resolve(this.texts.get(key) ?? null);
   }
   getBinary(key: string) {
@@ -215,6 +218,18 @@ describe("fetchManifest", () => {
     expect(m?.run_id).toBe("run-9");
   });
 
+  it("reads latest past the HTTP cache, and only latest", async () => {
+    const { store, make } = build([]);
+    store.texts.set(latestKey(42), "run-9");
+    store.texts.set(manifestKey(42, "run-9"), JSON.stringify(manifest([], "run-9")));
+
+    await make().fetchManifest(42);
+
+    // A cached latest hid a manual worker run for hours (issue #10). The
+    // manifest it names is write-once, so caching that is fine.
+    expect(store.freshReads).toEqual([latestKey(42)]);
+  });
+
   it("returns null before the worker has published the course", async () => {
     const { make } = build([]);
     expect(await make().fetchManifest(42)).toBeNull();
@@ -273,6 +288,56 @@ describe("writeEntry: downloading", () => {
     expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
     // And no part file is left behind.
     expect([...adapter.files.keys()].filter((k) => k.includes(".parts"))).toEqual([]);
+  });
+});
+
+describe("progress", () => {
+  it("counts each file it writes, and ends full", async () => {
+    const { make } = build(["aa", "bbbb"]);
+    const seen: SyncProgress[] = [];
+    await make().syncCourse(manifest([entry("a.pdf", "aa"), entry("b.pdf", "bbbb")]), {
+      onProgress: (p) => seen.push({ ...p }),
+    });
+
+    expect(seen[0]).toEqual({ files: 0, filesTotal: 2, bytes: 0, bytesTotal: 6, current: "a.pdf" });
+    expect(seen.at(-1)).toEqual({ files: 2, filesTotal: 2, bytes: 6, bytesTotal: 6, current: undefined });
+    // Bytes never go backwards, so the bar never jumps back.
+    const bytes = seen.map((p) => p.bytes);
+    expect(bytes).toEqual([...bytes].sort((x, y) => x - y));
+  });
+
+  it("advances by chunk through a large file", async () => {
+    const big = "x".repeat(9 * 1024 * 1024);
+    const { adapter, make } = build([big]);
+    const seen: number[] = [];
+    await make().syncCourse(manifest([entry("rec.mp4", big)]), { onProgress: (p) => seen.push(p.bytes) });
+
+    // Desktop chunks are 8 MiB: one report per chunk, then the closing one.
+    expect(seen).toEqual([0, 8 * 1024 * 1024, big.length, big.length]);
+    expect(adapter.files.get(`${C}/rec.mp4`)?.byteLength).toBe(big.length);
+  });
+
+  it("leaves out files it will not write, and says nothing when there are none", async () => {
+    const { state, make } = build(["new"]);
+    state.lastRunId["42"] = "run-1";
+    const seen: SyncProgress[] = [];
+    // An automatic pull only refreshes files the vault has; a new file is not one.
+    await make().syncCourse(manifest([entry("a.pdf", "new")]), {
+      mode: "automatic", onProgress: (p) => seen.push(p),
+    });
+
+    expect(seen).toEqual([]);
+  });
+
+  it("counts a failed file as done, so the bar still ends full", async () => {
+    const { make } = build(["ok"]);
+    const seen: SyncProgress[] = [];
+    const res = await make().syncCourse(manifest([entry("gone.pdf", "not in store"), entry("ok.pdf", "ok")]), {
+      onProgress: (p) => seen.push({ ...p }),
+    });
+
+    expect(res.errors).toHaveLength(1);
+    expect(seen.at(-1)).toMatchObject({ files: 2, filesTotal: 2 });
   });
 });
 
