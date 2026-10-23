@@ -1,10 +1,26 @@
 import { App, PluginSettingTab, Setting, Plugin, setIcon } from "obsidian";
 import { Policy, validate } from "./policy";
 import { CourseCheck, parseCourseIds, sameIds } from "./courses";
+import type { CanvasCourse } from "./canvas";
+
+/**
+ * Where files are read from: a stele-pull store the worker fills, or Canvas
+ * itself, for anyone who cannot host a store.
+ */
+export type SourceKind = "store" | "canvas";
+
+/**
+ * SecretStorage id of the Canvas access token. The token is never a setting:
+ * settings go to data.json, inside the vault, synced wherever the vault is.
+ */
+export const CANVAS_TOKEN_SECRET = "stele-pull-canvas-token";
 
 export interface StelePullSettings {
+  source: SourceKind;
   baseUrl: string;
   bucket: string;
+  /** Direct mode only, e.g. https://canvas.nus.edu.sg. */
+  canvasUrl: string;
   courses: number[];
   targetFolder: string;
   trashFolder: string;
@@ -15,8 +31,10 @@ export interface StelePullSettings {
 }
 
 export const DEFAULT_SETTINGS: StelePullSettings = {
+  source: "store",
   baseUrl: "",
   bucket: "stele-pull",
+  canvasUrl: "",
   courses: [],
   targetFolder: "Canvas",
   trashFolder: "Canvas/_trash",
@@ -37,15 +55,25 @@ export type StelePullPluginLike = Plugin & {
   settings: StelePullSettings;
   save(): Promise<void>;
   rescheduleSync(): void;
-  /** Look each course ID up in the store. */
+  /** Look each course ID up in the source. */
   checkCourses(ids: number[]): Promise<CourseCheck[]>;
+  /** Whether there is a source to read and a course to read from it. */
+  ready(): boolean;
+  canvasToken(): string | null;
+  setCanvasToken(token: string | null): void;
+  canvasCourses(): Promise<CanvasCourse[]>;
   /** The last lookup, so its report survives the panel re-rendering. */
   courseCheck?: { ids: number[]; results: CourseCheck[] };
 };
 
-const COURSES_DESC =
-  "Comma-separated numeric Canvas course IDs, e.g. 93794. The store is keyed by ID, " +
-  "not course code: run stele-pull ls or stele-pull-worker courses to list them.";
+const COURSES_DESC: Record<SourceKind, string> = {
+  store:
+    "Comma-separated numeric Canvas course IDs, e.g. 93794. The store is keyed by ID, " +
+    "not course code: run stele-pull ls or stele-pull-worker courses to list them.",
+  canvas:
+    "Comma-separated numeric Canvas course IDs, e.g. 93794: the number in the course's " +
+    "Canvas address. Show my courses, above, lists them.",
+};
 const RULES_DESC =
   "Applied to the manifest locally. Reversible: changing these never needs a refetch.";
 
@@ -63,38 +91,36 @@ export function renderSettings(
   plugin: StelePullPluginLike,
   onCoursesChanged?: () => void,
 ) {
-  new Setting(containerEl).setName("Store").setHeading();
+  // Switching source changes which fields apply, so draw the form again.
+  const redraw = () => {
+    containerEl.empty();
+    renderSettings(containerEl, plugin, onCoursesChanged);
+    onCoursesChanged?.();
+  };
+
+  new Setting(containerEl).setName("Source").setHeading();
 
   new Setting(containerEl)
-    .setName("Store URL")
+    .setName("Read files from")
     .setDesc(
-      "Read-only endpoint for the stele-pull bucket. Prefer an endpoint already " +
-      "protected at the network layer (Tailscale, auth proxy) so no credentials " +
-      "are stored in the vault. For local development, run stele-pull serve and " +
-      "use http://127.0.0.1:8765.",
+      "A stele-pull store that the worker fills on a schedule, or Canvas directly " +
+      "if you have no store of your own.",
     )
-    .addText((t) =>
-      t
-        .setPlaceholder("https://stele-pull.tailnet.ts.net")
-        .setValue(plugin.settings.baseUrl)
+    .addDropdown((d) =>
+      d
+        .addOption("store", "Your stele-pull store")
+        .addOption("canvas", "Canvas directly")
+        .setValue(plugin.settings.source)
         .onChange(async (v) => {
-          plugin.settings.baseUrl = v.trim();
+          plugin.settings.source = v === "canvas" ? "canvas" : "store";
+          plugin.courseCheck = undefined;
           await plugin.save();
+          redraw();
         }),
     );
 
-  new Setting(containerEl)
-    .setName("Bucket")
-    .setDesc(
-      "Path segment between the URL and the store keys. Leave empty if the URL " +
-      "already points at the bucket root; stele-pull serve accepts either.",
-    )
-    .addText((t) =>
-      t.setValue(plugin.settings.bucket).onChange(async (v) => {
-        plugin.settings.bucket = v.trim();
-        await plugin.save();
-      }),
-    );
+  if (plugin.settings.source === "canvas") renderCanvasSource(containerEl, plugin, redraw);
+  else renderStoreSource(containerEl, plugin);
 
   // Without this the plugin has nothing to pull and no way to be told what to
   // pull. It is the one setting that cannot be defaulted.
@@ -103,11 +129,12 @@ export function renderSettings(
   // no notices. Saving on every keystroke reloaded the whole panel, which
   // closed this form and raised "add a course ID" while the field was empty.
   // Enter, or leaving the field, saves the list and looks each ID up.
-  const courses = new Setting(containerEl).setName("Course IDs").setDesc(COURSES_DESC);
+  const coursesDesc = COURSES_DESC[plugin.settings.source];
+  const courses = new Setting(containerEl).setName("Course IDs").setDesc(coursesDesc);
   const report = containerEl.createDiv({ cls: "stele-pull-course-report" });
   const cached = plugin.courseCheck;
   if (cached && sameIds(cached.ids, plugin.settings.courses)) {
-    renderCourseReport(report, cached.results, []);
+    renderCourseReport(report, cached.results, [], plugin.settings.source);
   }
 
   courses.addText((t) => {
@@ -115,7 +142,7 @@ export function renderSettings(
     t.onChange((v) => {
       const { bad } = parseCourseIds(v);
       courses.setDesc(
-        bad.length > 0 ? `Not a course ID: ${bad.join(", ")}. Use numbers separated by commas.` : COURSES_DESC,
+        bad.length > 0 ? `Not a course ID: ${bad.join(", ")}. Use numbers separated by commas.` : coursesDesc,
       );
       courses.descEl.toggleClass("stele-pull-error", bad.length > 0);
     });
@@ -130,12 +157,15 @@ export function renderSettings(
         report.empty();
         if (ids.length === 0) {
           plugin.courseCheck = undefined;
-          renderCourseReport(report, [], bad);
+          renderCourseReport(report, [], bad, plugin.settings.source);
         } else {
-          report.createDiv({ cls: "stele-pull-muted", text: "Checking the store..." });
+          report.createDiv({
+            cls: "stele-pull-muted",
+            text: plugin.settings.source === "canvas" ? "Checking Canvas..." : "Checking the store...",
+          });
           const results = await plugin.checkCourses(ids);
           plugin.courseCheck = { ids, results };
-          renderCourseReport(report, results, bad);
+          renderCourseReport(report, results, bad, plugin.settings.source);
         }
         // Reload the panel once, and only if the list really changed.
         if (changed) onCoursesChanged?.();
@@ -236,8 +266,138 @@ export function renderSettings(
   });
 }
 
+function renderStoreSource(containerEl: HTMLElement, plugin: StelePullPluginLike) {
+  new Setting(containerEl)
+    .setName("Store URL")
+    .setDesc(
+      "Read-only endpoint for the stele-pull bucket. Prefer an endpoint already " +
+      "protected at the network layer (Tailscale, auth proxy) so no credentials " +
+      "are stored in the vault. For local development, run stele-pull serve and " +
+      "use http://127.0.0.1:8765.",
+    )
+    .addText((t) =>
+      t
+        .setPlaceholder("https://stele-pull.tailnet.ts.net")
+        .setValue(plugin.settings.baseUrl)
+        .onChange(async (v) => {
+          plugin.settings.baseUrl = v.trim();
+          await plugin.save();
+        }),
+    );
+
+  new Setting(containerEl)
+    .setName("Bucket")
+    .setDesc(
+      "Path segment between the URL and the store keys. Leave empty if the URL " +
+      "already points at the bucket root; stele-pull serve accepts either.",
+    )
+    .addText((t) =>
+      t.setValue(plugin.settings.bucket).onChange(async (v) => {
+        plugin.settings.bucket = v.trim();
+        await plugin.save();
+      }),
+    );
+}
+
+const TOKEN_DESC =
+  "Treated like a password. Create one in Canvas under Account, Settings, New access " +
+  "token, and give it an expiry date. It is kept in this device's Obsidian keychain, " +
+  "not in the vault or its settings file, so it is never synced: enter it on each device.";
+
+function renderCanvasSource(containerEl: HTMLElement, plugin: StelePullPluginLike, redraw: () => void) {
+  new Setting(containerEl)
+    .setName("Canvas URL")
+    .setDesc("Your institution's Canvas address.")
+    .addText((t) =>
+      t
+        .setPlaceholder("https://canvas.nus.edu.sg")
+        .setValue(plugin.settings.canvasUrl)
+        .onChange(async (v) => {
+          plugin.settings.canvasUrl = v.trim().replace(/\/+$/, "");
+          await plugin.save();
+        }),
+    );
+
+  const token = new Setting(containerEl).setName("Canvas access token").setDesc(TOKEN_DESC);
+  token.addText((t) => {
+    // Masked as it is typed, and never filled back in: the stored token does
+    // not appear in the page at all, only whether there is one.
+    t.inputEl.type = "password";
+    t.inputEl.autocomplete = "off";
+    t.inputEl.spellcheck = false;
+    t.setPlaceholder(plugin.canvasToken() ? "Saved. Paste a new token to replace it" : "Paste your token");
+    // Saved on Enter or leaving the field, not per keystroke.
+    t.inputEl.addEventListener("change", () => {
+      const v = t.getValue().trim();
+      if (!v) return;
+      plugin.setCanvasToken(v);
+      t.setValue("");
+      redraw();
+    });
+  });
+  if (plugin.canvasToken()) {
+    token.addExtraButton((b) =>
+      b.setIcon("trash").setTooltip("Forget the token on this device").onClick(() => {
+        plugin.setCanvasToken(null);
+        redraw();
+      }),
+    );
+  }
+
+  // Direct users have no worker to ask for course IDs, so Canvas lists them.
+  new Setting(containerEl)
+    .setName("Your courses")
+    .setDesc("Courses you are enrolled in this term, with their IDs.")
+    .addButton((b) =>
+      b.setButtonText("Show my courses").onClick(() => {
+        void (async () => {
+          list.empty();
+          list.createDiv({ cls: "stele-pull-muted", text: "Asking Canvas..." });
+          try {
+            renderCanvasCourses(list, await plugin.canvasCourses(), plugin, redraw);
+          } catch (e) {
+            list.empty();
+            list.createDiv({ cls: "stele-pull-error", text: e instanceof Error ? e.message : String(e) });
+          }
+        })();
+      }),
+    );
+  const list = containerEl.createDiv({ cls: "stele-pull-course-report" });
+}
+
+/** Each course with an Add button, or a tick once it is in the list. */
+function renderCanvasCourses(
+  el: HTMLElement,
+  courses: CanvasCourse[],
+  plugin: StelePullPluginLike,
+  redraw: () => void,
+) {
+  el.empty();
+  if (courses.length === 0) {
+    el.createDiv({ cls: "stele-pull-muted", text: "Canvas lists no active courses for this account." });
+    return;
+  }
+  for (const c of courses) {
+    const row = el.createDiv({ cls: "stele-pull-course-report-row" });
+    row.createSpan({ text: `${c.id}: ${c.name ?? c.course_code ?? ""}` });
+    if (plugin.settings.courses.includes(c.id)) {
+      setIcon(row.createSpan({ cls: "stele-pull-course-report-icon stele-pull-ok" }), "check");
+      continue;
+    }
+    const add = row.createEl("button", { text: "Add" });
+    add.addEventListener("click", () => {
+      void (async () => {
+        plugin.settings.courses = [...plugin.settings.courses, c.id];
+        plugin.courseCheck = undefined;
+        await plugin.save();
+        redraw();
+      })();
+    });
+  }
+}
+
 /** One line per course ID: found with its name, not found, or not checkable. */
-function renderCourseReport(el: HTMLElement, results: CourseCheck[], bad: string[]) {
+function renderCourseReport(el: HTMLElement, results: CourseCheck[], bad: string[], source: SourceKind) {
   el.empty();
   const line = (icon: string, cls: string, text: string) => {
     const row = el.createDiv({ cls: `stele-pull-course-report-row ${cls}` });
@@ -250,8 +410,9 @@ function renderCourseReport(el: HTMLElement, results: CourseCheck[], bad: string
         line("check", "stele-pull-ok", `${r.id}: ${r.name}`);
         break;
       case "missing":
-        line("x", "stele-pull-error",
-          `${r.id}: not in the store. Check the ID, or run the worker for this course first.`);
+        line("x", "stele-pull-error", source === "canvas"
+          ? `${r.id}: Canvas has no such course for this account. Check the ID.`
+          : `${r.id}: not in the store. Check the ID, or run the worker for this course first.`);
         break;
       case "error":
         line("alert-triangle", "stele-pull-warning", `${r.id}: could not check (${r.message})`);

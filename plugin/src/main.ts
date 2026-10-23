@@ -1,8 +1,9 @@
 import { Plugin, Notice, WorkspaceLeaf } from "obsidian";
-import { StelePullSettings, DEFAULT_SETTINGS, StelePullSettingTab } from "./settings";
+import { StelePullSettings, DEFAULT_SETTINGS, StelePullSettingTab, CANVAS_TOKEN_SECRET } from "./settings";
 import { LocalState, loadState, saveState, emptyState } from "./state";
 import { RemoteStore } from "./store";
-import { StoreSource } from "./source";
+import { Source, StoreSource, CanvasSource } from "./source";
+import { CanvasClient, CanvasCourse } from "./canvas";
 import { Syncer, notifyResult, PullProgress, SyncProgress } from "./sync";
 import { Manifest } from "./types";
 import { StelePullView, VIEW_TYPE_STELE_PULL } from "./ui/StelePullView";
@@ -89,16 +90,56 @@ export default class StelePullPlugin extends Plugin {
    *   explain themselves or stay silent.
    */
   makeSyncer(opts: { quiet?: boolean } = {}): Syncer | null {
-    if (!this.settings.baseUrl) {
-      if (!opts.quiet) new Notice("stele-pull: set the store URL in the panel's Setup section first");
+    const src = this.makeSource();
+    if (typeof src === "string") {
+      if (!opts.quiet) new Notice(`stele-pull: ${src} in the panel's Setup section first`);
       return null;
     }
     if (this.settings.courses.length === 0) {
       if (!opts.quiet) new Notice("stele-pull: add at least one course ID in the panel's Setup section");
       return null;
     }
-    const store = new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket });
-    return new Syncer(this, new StoreSource(store), this.settings.policy, this.state, this.settings);
+    return new Syncer(this, src, this.settings.policy, this.state, this.settings);
+  }
+
+  /** Whether there is a source to read and a course to read from it. */
+  ready(): boolean {
+    return typeof this.makeSource() !== "string" && this.settings.courses.length > 0;
+  }
+
+  /** The configured source, or what is missing before there can be one. */
+  private makeSource(): Source | string {
+    if (this.settings.source === "canvas") {
+      const token = this.canvasToken();
+      if (!this.settings.canvasUrl) return "set the Canvas URL";
+      if (!token) return "enter a Canvas access token";
+      return new CanvasSource(new CanvasClient(this.settings.canvasUrl, token));
+    }
+    if (!this.settings.baseUrl) return "set the store URL";
+    return new StoreSource(new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket }));
+  }
+
+  /**
+   * The Canvas access token, from Obsidian's per-device secret storage. Never
+   * in settings: data.json lives in the vault and travels wherever it syncs.
+   */
+  canvasToken(): string | null {
+    return this.app.secretStorage.getSecret(CANVAS_TOKEN_SECRET) || null;
+  }
+
+  /** Save the token, or forget it with null. */
+  setCanvasToken(token: string | null) {
+    // SecretStorage has no delete; an empty secret reads as none.
+    this.app.secretStorage.setSecret(CANVAS_TOKEN_SECRET, token ?? "");
+  }
+
+  /** Courses the token's account is enrolled in, for Setup. Throws when Canvas is not set up. */
+  async canvasCourses(): Promise<CanvasCourse[]> {
+    const token = this.canvasToken();
+    if (!this.settings.canvasUrl || !token) throw new Error("set the Canvas URL and access token first");
+    const all = await new CanvasClient(this.settings.canvasUrl, token).courses();
+    // Courses outside their term dates come back as bare stubs with no name.
+    return all.filter((c) => !c.access_restricted_by_date && c.name);
   }
 
   /**
@@ -196,13 +237,13 @@ export default class StelePullPlugin extends Plugin {
     for (const cb of this.progressListeners) cb(p);
   }
 
-  /** Look each course ID up in the store, for the Setup form. Never raises a notice. */
+  /** Look each course ID up in the source, for the Setup form. Never raises a notice. */
   async checkCourses(ids: number[]): Promise<CourseCheck[]> {
-    if (!this.settings.baseUrl) {
-      return ids.map((id): CourseCheck => ({ id, status: "error", message: "set the store URL first" }));
+    const src = this.makeSource();
+    if (typeof src === "string") {
+      return ids.map((id): CourseCheck => ({ id, status: "error", message: `${src} first` }));
     }
-    const store = new StoreSource(new RemoteStore({ baseUrl: this.settings.baseUrl, bucket: this.settings.bucket }));
-    return checkCourses(ids, (id) => store.course(id));
+    return checkCourses(ids, (id) => src.course(id));
   }
 
   currentStatus(): string {

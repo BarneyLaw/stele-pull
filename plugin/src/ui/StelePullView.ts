@@ -85,7 +85,7 @@ export class StelePullView extends ItemView {
     ];
     this.render();
     // Only reach for the network if there is somewhere to reach.
-    if (this.plugin.settings.baseUrl && this.plugin.settings.courses.length > 0) {
+    if (this.plugin.ready()) {
       await this.refresh();
     }
   }
@@ -197,10 +197,10 @@ export class StelePullView extends ItemView {
   }
 
   private renderBody(body: HTMLElement) {
-    if (!this.plugin.settings.baseUrl || this.plugin.settings.courses.length === 0) {
+    if (!this.plugin.ready()) {
       body.createEl("p", {
         cls: "stele-pull-muted",
-        text: "Set a store URL and at least one course ID in Setup below to get started.",
+        text: "Choose where to read from and add at least one course ID in Setup below to get started.",
       });
       return;
     }
