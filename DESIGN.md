@@ -376,6 +376,7 @@ drift before the user sees a preview that does not match what the worker did.
 | `manifest-golden.json` | **generated** by the Go types | `internal/manifest` (byte-for-byte equal to what `Encode` writes) | `contract.test.ts`, `preview.test.ts` |
 | `store-contract.json` | **generated** | `internal/manifest` | `contract.test.ts` (key layout, `obsync:pull-scope`, states) |
 | `manifest-invalid.json` | hand-written | `internal/manifest` (`Decode` must refuse) | `contract.test.ts` (`parseManifest` must refuse) |
+| `canvas-paths.json` | **generated** by the worker's path builder | `internal/run` | `canvas.test.ts` (direct mode names every file identically) |
 
 The generated fixtures are rewritten with
 `go test ./internal/manifest -run TestContractFixtures -update`, so a change to
@@ -407,6 +408,30 @@ proxy and do plain GETs. No SigV4, no signing library, no secret at rest.
 If you do want direct S3, use `aws4fetch` with a **read-only** Garage key so a
 leak costs course slides rather than the bucket. Verify early that SubtleCrypto
 is available in Obsidian's mobile origin, since aws4fetch depends on it.
+
+### Direct-Canvas mode
+
+For users who cannot host a store, the plugin can read Canvas itself. This
+bends two rules above, on purpose and only in that mode.
+
+- **It holds a credential.** A Canvas token cannot be made read-only, so it
+  must never reach `data.json`. It lives in Obsidian's per-device
+  `SecretStorage`, is entered into a masked field and never shown again, and
+  goes only to the configured Canvas origin. Downloads follow the file's
+  verifier URL with no token, like the worker's credential-free client.
+- **It shares the worker's path logic, ported.** The rule against two
+  implementations still holds for the *diff*: direct mode builds the same
+  `Manifest` and hands it to the same consumer loop. The one thing it cannot
+  avoid duplicating is turning a Canvas listing into paths (`portable`, the
+  `course files` strip, dedupe and disambiguation), because a vault switched
+  between modes must not move a file. `canvas-paths.json` pins that.
+
+With no content hash from Canvas, "unchanged" is the worker's own test
+(`plan.unchanged`) against the Canvas metadata this device recorded when it
+wrote the file. A new or changed file has no hash until it is downloaded, so
+the conflict check that normally runs before a download runs after it instead,
+and the size check is what catches a short read. Large files still use Range
+GETs: Canvas's file storage answers them with 206.
 
 ### Consumer sync loop
 
