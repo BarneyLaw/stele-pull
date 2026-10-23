@@ -47,8 +47,21 @@ export class RemoteStore {
     return requestUrl({ ...p, throw: false });
   }
 
-  async getText(key: string): Promise<string | null> {
-    const r = await this.request({ url: this.url(key), method: "GET" });
+  /**
+   * @param opts.fresh - go to the store, past every HTTP cache. Required for
+   *   `latest`, the one mutable key. Garage's web endpoint sends Last-Modified
+   *   and no Cache-Control, so requestUrl's cache (Chromium's, on desktop)
+   *   treats it as fresh for a tenth of its age: a pointer published yesterday
+   *   is served from cache for over two hours, hiding a manual worker run.
+   *   The query string defeats any cache keyed on the URL (mobile's native
+   *   stacks, proxies); Garage and `stele-pull serve` both ignore it.
+   */
+  async getText(key: string, opts: { fresh?: boolean } = {}): Promise<string | null> {
+    const r = await this.request(
+      opts.fresh
+        ? { url: `${this.url(key)}?t=${Date.now()}`, method: "GET", headers: { "Cache-Control": "no-cache" } }
+        : { url: this.url(key), method: "GET" },
+    );
     if (r.status === 404) return null;
     if (r.status >= 400) throw new Error(`stele-pull: GET ${key} -> ${r.status}`);
     return r.text;
