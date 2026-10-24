@@ -28,18 +28,18 @@ export function sameIds(a: readonly number[], b: readonly number[]): boolean {
 /**
  * Look every ID up at once, keeping the typed order.
  *
- * "Found" means the worker has published a manifest for the course; the plugin
- * cannot see Canvas itself. One unreachable lookup is reported for that ID and
- * does not hide the others.
+ * "Found" means the source knows the course: the worker has published a
+ * manifest for it, or, in direct mode, Canvas lists it for this account. One
+ * unreachable lookup is reported for that ID and does not hide the others.
  */
 export async function checkCourses(
   ids: readonly number[],
-  fetchManifest: (id: number) => Promise<Manifest | null>,
+  lookup: (id: number) => Promise<Pick<Manifest, "course_name" | "course_code"> | null>,
 ): Promise<CourseCheck[]> {
   return Promise.all(
     ids.map(async (id): Promise<CourseCheck> => {
       try {
-        const m = await fetchManifest(id);
+        const m = await lookup(id);
         if (!m) return { id, status: "missing" };
         return { id, status: "found", name: m.course_name || m.course_code || `Course ${id}` };
       } catch (e) {

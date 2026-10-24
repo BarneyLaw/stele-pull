@@ -5,7 +5,11 @@ per-device exclusion rules.
 
 This is the **consumer** half of stele-pull. A Go worker (a Kubernetes CronJob)
 pulls files out of Canvas into an object store and publishes a manifest; this
-plugin mirrors that store into your vault. The plugin never talks to Canvas.
+plugin mirrors that store into your vault.
+
+No store of your own? **Direct mode** reads Canvas itself, with your Canvas
+access token, and lands every file exactly where the worker would have. See
+[Setup](#setup).
 
 See `DESIGN.md` for the whole system.
 
@@ -42,6 +46,10 @@ surfaces cannot drift apart. Use whichever you prefer.
 
 ## Setup
 
+First choose where **Read files from**.
+
+**Your stele-pull store** (the worker runs somewhere):
+
 1. Set **Store URL** to the read-only endpoint for your stele-pull bucket. For
    local development, run `stele-pull serve` in the repo root and use
    `http://127.0.0.1:8765`; leave **Bucket** as `stele-pull` or empty, it accepts
@@ -49,13 +57,24 @@ surfaces cannot drift apart. Use whichever you prefer.
 2. Set **Course IDs** to a comma-separated list of numeric Canvas course IDs.
    The store is keyed by ID, not course code: `stele-pull ls` or
    `stele-pull-worker courses` lists them.
-3. Pick a **Target folder**. Keep it to itself; see the warning below.
+
+**Canvas directly** (no store, no worker):
+
+1. Set **Canvas URL**, e.g. `https://canvas.nus.edu.sg`.
+2. In Canvas, go to Account, Settings, **New access token**, give it an expiry
+   date, and paste it into **Canvas access token**. See
+   [Credentials](#credentials) for where it is kept.
+3. Press **Show my courses** and **Add** the ones you want, or type their IDs
+   into **Course IDs**.
+
+Then, either way, pick a **Target folder**. Keep it to itself; see the warning
+below.
 
 The panel starts fetching as soon as those are filled in.
 
 ### Credentials
 
-There are none, by design. Plugin settings persist to
+With a store there are none, by design. Plugin settings persist to
 `.obsidian/plugins/stele-pull/data.json` **inside the vault**, which is synced by
 whatever else syncs the vault — an S3 secret there travels everywhere the vault
 does. Since phase 1 consumers are read-only, expose the bucket behind Tailscale
@@ -64,6 +83,26 @@ or an auth proxy and do plain GETs.
 If you must sign requests directly, use `aws4fetch` with a **read-only** Garage
 key, and verify SubtleCrypto is actually available in Obsidian's mobile origin
 first. See the comments at the top of `src/store.ts`.
+
+Direct mode cannot avoid one: a Canvas access token acts as you, with your full
+account access. So it is treated like a password. It is typed into a masked
+field and never shown again, only whether one is saved. It is kept in
+Obsidian's per-device **SecretStorage**, never in `data.json`, so it is not
+synced with the vault: enter it on each device. It is sent only to the Canvas
+URL you set. File downloads carry Canvas's own short verifier instead, and the
+token never reaches Canvas's file storage. Give the token an expiry date, and
+revoke it in Canvas if a device is lost.
+
+How direct mode differs from a store:
+
+- Canvas exposes no content hash. A file counts as unchanged while its Canvas
+  id, size, `updated_at` and `modified_at` match what this device recorded
+  writing, the worker's own test. A new or changed file is hashed as it
+  downloads, and only then compared with anything already in the vault.
+- There are no worker rules, only yours. The default `no-huge` rule still
+  holds back anything over 50 MB until you change it.
+- Every refresh and automatic pull lists each course in Canvas: three or four
+  API requests per course.
 
 ## Exclusion rules
 

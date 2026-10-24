@@ -197,6 +197,7 @@ checked from both sides against the same files in `schema/`:
 | `manifest-golden.json` | `go test ./internal/manifest -run TestContractFixtures -update` | Go (byte-for-byte), plugin `contract.test.ts`, `preview.test.ts` |
 | `store-contract.json` | same command | Go, plugin `contract.test.ts` |
 | `manifest-invalid.json` | hand | Go `Decode`, plugin `parseManifest` |
+| `canvas-paths.json` | `go test ./internal/run -run TestCanvasPathsFixture -update` | Go (byte-for-byte), plugin `canvas.test.ts`: direct mode must name every file as the worker does |
 
 Never edit a generated fixture by hand; never copy any of them into `plugin/`.
 
@@ -206,7 +207,7 @@ CI is two workflows in `.github/workflows/`:
 |---|---|---|
 | `worker.yml` | `cmd/`, `internal/`, `go.mod`, `go.sum`, `Dockerfile`, `deploy/`, the Garage and render scripts | tidy, gofmt, vet, race tests, fixture regeneration diff, build, cross-compile, smoke, manifest render, Garage S3 integration, image smoke; on `main`, publish the image and update homelab-cicd-config (see [deploy/README.md](deploy/README.md)) |
 | `plugin.yml` | `plugin/` (not Markdown) | `npm ci`, lint, tests, type-check and bundle on Node 22 and 24, release metadata, bundle artifact |
-| **both** | `schema/`, `internal/manifest`, `internal/policy`, `internal/plan`, `cmd/stele-pull`, and the plugin's `types`, `policy`, `preview`, `store`, `sync` and tests | cross-check each half against the same contract |
+| **both** | `schema/`, `internal/manifest`, `internal/policy`, `internal/plan`, `internal/portable`, `internal/run`, `cmd/stele-pull`, and the plugin's `types`, `policy`, `preview`, `store`, `sync`, `portable`, `canvas` and tests | cross-check each half against the same contract |
 
 The contract path list is identical in both files; change them together. Each
 runs on pushes to `main`, on pull requests, and manually. Because of the path

@@ -4,6 +4,8 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { Plugin } from "obsidian";
 import { Syncer, SyncProgress, uniquify } from "./sync";
 import { RemoteStore } from "./store";
+import { StoreSource, CanvasSource } from "./source";
+import { CanvasClient, CanvasFile } from "./canvas";
 import { Manifest, Entry, blobKey, latestKey, manifestKey } from "./types";
 import { FileRecord, LocalState, emptyState, loadState } from "./state";
 import { Policy } from "./policy";
@@ -203,7 +205,7 @@ function build(contents: string[]) {
   const store = new FakeStore(blobs);
   const state = emptyState();
   const make = (s: LocalState = state) =>
-    new Syncer(plugin as unknown as Plugin, store as unknown as RemoteStore, OPEN, s, FOLDERS);
+    new Syncer(plugin as unknown as Plugin, new StoreSource(store as unknown as RemoteStore), OPEN, s, FOLDERS);
   return { adapter, plugin, store, state, make };
 }
 
@@ -278,8 +280,8 @@ describe("writeEntry: downloading", () => {
   it("refuses bytes whose hash does not match the manifest", async () => {
     const { adapter, store, make } = build([]);
     const e = entry("a.pdf", "hello");
-    // Store serves the wrong content under the expected key.
-    store.blobs.set(blobKey(e.sha256!), enc("tampered"));
+    // Store serves the wrong content, of the right length, under the expected key.
+    store.blobs.set(blobKey(e.sha256!), enc("hellp"));
 
     const res = await make().syncCourse(manifest([e]));
 
@@ -288,6 +290,17 @@ describe("writeEntry: downloading", () => {
     expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
     // And no part file is left behind.
     expect([...adapter.files.keys()].filter((k) => k.includes(".parts"))).toEqual([]);
+  });
+
+  it("refuses a download of the wrong length before looking at its hash", async () => {
+    const { adapter, store, make } = build([]);
+    const e = entry("a.pdf", "hello");
+    store.blobs.set(blobKey(e.sha256!), enc("hell"));
+
+    const res = await make().syncCourse(manifest([e]));
+
+    expect(res.errors[0]).toMatch(/size mismatch: expected 5 bytes, received 4/);
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
   });
 });
 
@@ -704,6 +717,192 @@ describe("files deleted from the vault", () => {
     files(state)["gone.pdf"] = { sha256: hashOf("x"), size: 1, writtenAt: 0 };
     const m = manifest([entry("gone.pdf", "x", { state: "deleted" })]);
     expect((await make(state).missingFiles(m)).size).toBe(0);
+  });
+});
+
+/** A Canvas account with one course: files by id, bytes by download url. */
+class FakeCanvas {
+  listing = new Map<number, CanvasFile>();
+  bytes = new Map<string, Uint8Array>();
+  downloads: { url: string; range?: { offset: number; length: number } }[] = [];
+  /** Canvas lookups of a single file, for its download url. */
+  lookups: number[] = [];
+
+  put(id: number, name: string, content: string | Uint8Array, over: Partial<CanvasFile> = {}) {
+    const url = `https://canvas.example/files/${id}/download?verifier=v`;
+    const data = typeof content === "string" ? enc(content) : content;
+    this.bytes.set(url, data);
+    this.listing.set(id, {
+      id, folder_id: 1, display_name: name, size: data.byteLength, url,
+      updated_at: "2026-01-01T00:00:00Z", modified_at: "2026-01-01T00:00:00Z", ...over,
+    });
+  }
+
+  course(id: number) {
+    return Promise.resolve(id === 42 ? { id, name: "TST1001 Testing [2610]", course_code: "TST1001" } : null);
+  }
+  files() { return Promise.resolve([...this.listing.values()]); }
+  folders() { return Promise.resolve([{ id: 1, full_name: "course files" }]); }
+  file(id: number) {
+    this.lookups.push(id);
+    return Promise.resolve(this.listing.get(id)!);
+  }
+  download(url: string, range?: { offset: number; length: number }) {
+    this.downloads.push({ url, range });
+    const b = this.bytes.get(url)!;
+    const s = range ? b.slice(range.offset, range.offset + range.length) : b;
+    return Promise.resolve(s.buffer.slice(s.byteOffset, s.byteOffset + s.byteLength) as ArrayBuffer);
+  }
+}
+
+describe("direct from Canvas", () => {
+  function direct() {
+    const { adapter, plugin, state } = build([]);
+    const canvas = new FakeCanvas();
+    // The real CanvasSource and manifest builder; only the HTTP is fake.
+    const client = canvas as unknown as CanvasClient;
+    const make = () => new Syncer(plugin as unknown as Plugin, new CanvasSource(client), OPEN, state, FOLDERS);
+    const sync = async (opts: { mode?: "manual" | "automatic" } = {}) => {
+      const s = make();
+      const m = (await s.fetchManifest(42))!;
+      return { res: await s.syncCourse(m, opts), m };
+    };
+    return { adapter, state, canvas, make, sync };
+  }
+
+  it("downloads a new file, then records its hash and Canvas metadata", async () => {
+    const { adapter, state, canvas, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+
+    const { res } = await sync();
+
+    expect(res.added).toBe(1);
+    expect(adapter.read(`${C}/a.pdf`)).toBe("hello");
+    expect(files(state)["a.pdf"]).toMatchObject({
+      sha256: hashOf("hello"), size: 5, canvasId: 7, updatedAt: "2026-01-01T00:00:00Z",
+    });
+  });
+
+  it("downloads nothing again while Canvas reports the file unchanged", async () => {
+    const { canvas, make, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    await sync();
+    canvas.downloads = [];
+
+    const s = make();
+    const m = (await s.fetchManifest(42))!;
+    expect(s.previewCourse(m, await s.missingFiles(m)).alreadyHave).toBe(1);
+    expect(await s.needsSync(m)).toBe(false);
+    expect((await s.syncCourse(m)).added).toBe(0);
+    expect(canvas.downloads).toEqual([]);
+  });
+
+  it("refreshes a file Canvas has changed, on an automatic pull", async () => {
+    const { adapter, canvas, make, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    await sync();
+    canvas.put(7, "a.pdf", "world", { updated_at: "2026-02-01T00:00:00Z" });
+
+    expect(await make().needsSync((await make().fetchManifest(42))!)).toBe(true);
+    const { res } = await sync({ mode: "automatic" });
+
+    expect(res.updated).toBe(1);
+    expect(adapter.read(`${C}/a.pdf`)).toBe("world");
+  });
+
+  it("adopts identical bytes already in the vault, such as on a second device", async () => {
+    const { adapter, state, canvas, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    adapter.write(`${C}/a.pdf`, "hello");
+
+    const { res } = await sync();
+
+    expect(res.adopted).toBe(1);
+    expect(res.conflicts).toEqual([]);
+    expect(files(state)["a.pdf"]?.sha256).toBe(hashOf("hello"));
+    // Judged only after downloading, so the part file must not linger.
+    expect([...adapter.files.keys()].filter((k) => k.includes(".parts"))).toEqual([]);
+  });
+
+  it("quarantines a different file it has no record of writing", async () => {
+    const { adapter, canvas, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    adapter.write(`${C}/a.pdf`, "my own notes");
+
+    const { res } = await sync();
+
+    expect(res.conflicts).toEqual(["a.pdf"]);
+    expect(adapter.read(`Canvas/_conflicts/TST1001 [2610] (42)/a.pdf`)).toBe("my own notes");
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
+    expect([...adapter.files.keys()].filter((k) => k.includes(".parts"))).toEqual([]);
+  });
+
+  it("quarantines a file edited since it was pulled, when Canvas changes it", async () => {
+    const { adapter, canvas, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    await sync();
+    adapter.write(`${C}/a.pdf`, "edited", Date.now() + 60_000);
+    canvas.put(7, "a.pdf", "world", { updated_at: "2026-02-01T00:00:00Z" });
+
+    const { res } = await sync();
+
+    expect(res.conflicts).toEqual(["a.pdf"]);
+    expect(adapter.read(`Canvas/_conflicts/TST1001 [2610] (42)/a.pdf`)).toBe("edited");
+  });
+
+  it("moves a file Canvas no longer lists to the trash", async () => {
+    const { adapter, canvas, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    await sync();
+    canvas.listing.delete(7);
+
+    const { res } = await sync();
+
+    expect(res.removed).toBe(1);
+    expect(adapter.read(`Canvas/_trash/TST1001 [2610] (42)/a.pdf`)).toBe("hello");
+  });
+
+  it("refuses a short download, since there is no hash to catch it", async () => {
+    const { adapter, canvas, sync } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    canvas.listing.get(7)!.size = 6;
+
+    const { res } = await sync();
+
+    expect(res.errors[0]).toMatch(/size mismatch: expected 6 bytes, received 5/);
+    expect(adapter.files.has(`${C}/a.pdf`)).toBe(false);
+  });
+
+  it("pulls a large file in ranges", async () => {
+    const { adapter, state, canvas, sync } = direct();
+    const big = new Uint8Array(9 * 1024 * 1024).fill(7);
+    canvas.put(7, "rec.mp4", big);
+
+    await sync();
+
+    expect(canvas.downloads.map((d) => d.range)).toEqual([
+      { offset: 0, length: 8 * 1024 * 1024 },
+      { offset: 8 * 1024 * 1024, length: 1024 * 1024 },
+    ]);
+    expect(adapter.files.get(`${C}/rec.mp4`)?.byteLength).toBe(big.byteLength);
+    expect(files(state)["rec.mp4"]?.sha256).toBe(bytesToHex(sha256(big)));
+  });
+
+  it("asks Canvas for a download link when this source has not listed the course", async () => {
+    // The panel lists with one source and "Pull selected" pulls with another.
+    const { canvas, make } = direct();
+    canvas.put(7, "a.pdf", "hello");
+    const m = (await make().fetchManifest(42))!;
+
+    const res = await make().syncCourse(m);
+
+    expect(res.added).toBe(1);
+    expect(canvas.lookups).toEqual([7]);
+  });
+
+  it("reports a course Canvas does not have as no manifest", async () => {
+    const { make } = direct();
+    expect(await make().fetchManifest(9)).toBeNull();
   });
 });
 
